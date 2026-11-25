@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets/app.ico</ApplicationIcon>
+    <AssemblyName>Auto-宏</AssemblyName>
+    <RootNamespace>BAAxis</RootNamespace>
+    <AssemblyTitle>Auto-宏</AssemblyTitle>
+    <Product>Auto-宏</Product>
+  </PropertyGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="Assets/background.png" />
+    <EmbeddedResource Include="Assets/app-icon.png" />
+    <EmbeddedResource Include="Assets/app.ico" LogicalName="BAAxis.Assets.app.ico" />
+    <EmbeddedResource Include="Assets/restart-menu.png" LogicalName="BAAxis.Assets.restart-menu.png" />
+  </ItemGroup>
+</Project>

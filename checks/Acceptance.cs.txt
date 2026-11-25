@@ -1,0 +1,356 @@
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+
+namespace BAAxis;
+
+internal static class Acceptance
+{
+    private static Native.Input lastInput;
+    private static readonly List<string> results = [];
+    private static int failures;
+    private static int tests;
+    [DllImport("user32.dll")] private static extern uint MapVirtualKey(uint code, uint mapType);
+    public static uint CaptureInput(uint count, Native.Input[] inputs, int size)
+    {
+        Require(count == 1 && size == Marshal.SizeOf<Native.Input>(), "Invalid native input size");
+        lastInput = inputs[0];
+        return count;
+    }
+    private static void Require(bool ok, string reason) { if (!ok) throw new Exception(reason); }
+    private static void Test(string name, Action action)
+    {
+        tests++;
+        try { action(); results.Add("PASS " + name); }
+        catch (Exception ex) { failures++; results.Add("FAIL " + name + " | " + ex.Message); }
+        Console.WriteLine(results[^1]);
+    }
+    [STAThread]
+    static int Main()
+    {
+        Test("Existing self-test suite", () => SelfTest.Run([]));
+        Test("6000 EX steps across shuffled 6/10-student decks and file round-trips", SkillCycles);
+        Test("Invalid EX order, timing, roster and coordinates rejected", InvalidSkills);
+        Test("Keyboard scan codes and down/up/extended flags", Keyboard);
+        Test("Mouse five buttons, wheel, coordinates and input layout", Mouse);
+        Test("Recorder keyboard/mouse decoding and hotkey filtering", Recording);
+        Test("F6-F9 hook dispatch, repeat suppression and injected-key exclusion", Hotkeys);
+        Test("Two end modes and signed countdown after zero", EndModes);
+        Test("Delayed battle marker rebases subsequent inputs and post-action wait", DelayedMarker);
+        Test("Replay recorded prefix each round; end check only opens and closes Esc menu", RecordedPrefix);
+        Test("100-pass event order, overlap and scheduler timing", Timing);
+        Test("Release continues after one key-up fails", FailedRelease);
+        Test("Second-round Space hold survives skip-confirm cleanup", SpaceCollision);
+        Test("Repeated restart during restart procedure remains active", RepeatedRestart);
+        Test("Manual restart retries the same round and completes", ManualRestart);
+        Test("Short Space press and leading-zero scan code release exactly once", ShortSpace);
+        Test("Interrupted restart key hold can be restarted after pause", PausedRestart);
+        File.WriteAllLines("results.txt", results.Append($"Total {tests}, pass {tests-failures}, fail {failures}"));
+        return failures == 0 ? 0 : 1;
+    }
+    private static void Keyboard()
+    {
+        (uint Vk, ushort Scan, bool Extended)[] keys = [
+            (0x1B,1,false),(0x0D,28,false),(0x20,57,false),
+            (0x31,2,false),(0x32,3,false),(0x33,4,false),(0x34,5,false),(0x35,6,false),
+            (0x51,16,false),(0x52,19,false),(0x41,30,false),(0x53,31,false),
+            (0x75,64,false),(0x76,65,false),(0x77,66,false),(0x78,67,false),
+            (0xA0,42,false),(0xA1,54,false),(0xA2,29,false),(0xA3,29,true),
+            (0xA4,56,false),(0xA5,56,true),(0x26,72,true),(0x2E,83,true)];
+        foreach (var key in keys)
+        {
+            Require(MapVirtualKey(key.Vk, 0) == key.Scan, $"OS scan mapping differs for VK {key.Vk}");
+            foreach (var action in new[] { ActionKind.KeyDown, ActionKind.KeyUp })
+            {
+                Native.Send(new() { Action = action, Code = key.Scan.ToString(), Extended = key.Extended });
+                var k = lastInput.Data.Keyboard;
+                Require(lastInput.Type == 1 && k.Scan == key.Scan && k.Vk == 0, "Keyboard payload mismatch");
+                uint flags = 8u | (key.Extended ? 1u : 0u) | (action == ActionKind.KeyUp ? 2u : 0u);
+                Require(k.Flags == flags && k.Extra == Native.Marker, "Keyboard flags mismatch");
+            }
+        }
+        results.Add("INFO Verified 24 keys × down/up = 48 keyboard encodings; slots 1..5 = scan codes 2..6; F6=64 F7=65 F8=66 F9=67, Space=57 Esc=1 Enter=28");
+    }
+    private static void Hotkeys()
+    {
+        using var recorder=new Recorder();
+        var received=new List<int>();recorder.ControlKey=received.Add;
+        void Key(uint vk,uint flags,nuint extra=0)
+        {
+            nint pointer=Marshal.AllocHGlobal(Marshal.SizeOf<Native.KeyboardHook>());
+            try
+            {
+                Marshal.StructureToPtr(new Native.KeyboardHook { Vk=vk,Scan=64+vk-0x75,Flags=flags,Extra=extra },pointer,false);
+                typeof(Recorder).GetMethod("OnKeyboard",System.Reflection.BindingFlags.Instance|System.Reflection.BindingFlags.NonPublic)!.Invoke(recorder,[0,(nint)0x100,pointer]);
+            }
+            finally {Marshal.FreeHGlobal(pointer);}
+        }
+        Key(0x75,0);Key(0x75,0);Key(0x75,128);Key(0x75,0);Key(0x75,128);
+        Key(0x76,16,Native.Marker);Key(0x76,0);Key(0x76,128);Key(0x77,0);Key(0x77,128);Key(0x78,0);Key(0x78,128);
+        Require(received.SequenceEqual(new[]{1,1,2,3,4}),"Hotkey mapping or repeat suppression failed");
+    }
+    private static void EndModes()
+    {
+        var doc=LoopDocument();
+        var events=doc.Compile();
+        Require(doc.CheckAt(events)==200,"Remaining-time end ignored prefix offset");
+        doc.EndMode=EndCheckMode.AfterLastAction;doc.EndWaitMs=250;
+        Require(doc.CheckAt(doc.Compile())==300,"Post-operation wait was measured from wrong origin");
+        doc.Events.Add(new() {Action=ActionKind.Move,Remaining="-00:00.100"});
+        Require(doc.CheckAt(doc.Compile())==1400,"After-last-action mode clipped events after countdown zero");
+        Require(AxisDocument.Parse(AxisDocument.Format(-1234))==-1234,"Signed recording timestamp lost elapsed time");
+        doc.EndMode=EndCheckMode.Remaining;
+        bool rejected=false;try{doc.Compile();}catch(ArgumentException){rejected=true;}
+        Require(rejected,"Remaining-time mode accepted actions after end");
+    }
+    private static void DelayedMarker()
+    {
+        var doc=new AxisDocument { Total="00:01.000",BattleStartOffsetMs=50,EndMode=EndCheckMode.AfterLastAction,EndWaitMs=60,Events=[
+            new() {Action=ActionKind.Move,Remaining="00:01.050"},
+            new() {Action=ActionKind.KeyDown,Code="57",Remaining="00:01.000",IsBattleStart=true},
+            new() {Action=ActionKind.KeyUp,Code="57",Remaining="00:00.980"}] };
+        var clock=Stopwatch.StartNew();double down=0,up=0;
+        var runner=new Runner(doc,1,e=> {if(e.Action==ActionKind.Move) Thread.Sleep(100);else if(e.Action==ActionKind.KeyDown) down=clock.Elapsed.TotalMilliseconds;else if(e.Action==ActionKind.KeyUp) up=clock.Elapsed.TotalMilliseconds;});
+        var thread=Start(runner);Require(thread.Join(2000),"Delayed marker test did not finish");
+        Require(up-down>=15,"Post-marker events did not follow actual battle start");
+        Require(clock.Elapsed.TotalMilliseconds-up>=55,"Post-action wait did not follow actual final input");
+    }
+    private static void RecordedPrefix()
+    {
+        var doc=new AxisDocument { Total="00:01.000",BattleStartOffsetMs=20,EndMode=EndCheckMode.AfterLastAction,EndWaitMs=5,Events=[
+            new() {Action=ActionKind.KeyDown,Code="19",Remaining="00:01.020"},
+            new() {Action=ActionKind.KeyUp,Code="19",Remaining="00:01.015"},
+            new() {Action=ActionKind.KeyDown,Code="57",Remaining="00:01.000",IsBattleStart=true},
+            new() {Action=ActionKind.KeyUp,Code="57",Remaining="00:00.995"}] };
+        var emitted=new List<string>();
+        var runner=new Runner(doc,2,e=>emitted.Add($"{e.Action}/{e.Code}"),_=>RestartDetection.CreateSample());
+        var thread=Start(runner);Require(thread.Join(3000),"Recorded-prefix cycle timed out");
+        string[] prefix=["KeyDown/19","KeyUp/19","KeyDown/57","KeyUp/57"];
+        Require(emitted.SequenceEqual(prefix.Concat(new[]{"KeyDown/1","KeyUp/1","KeyDown/1","KeyUp/1"}).Concat(prefix)),"Cycle inserted automatic restart inputs or failed to replay user prefix");
+    }
+    private static void SkillCycles()
+    {
+        var random = new Random(731);
+        foreach (int size in new[] {6,10})
+        for (int trial=0;trial<30;trial++)
+        {
+            int handSize=size==6?3:5;
+            var order=Enumerable.Range(1,size).OrderBy(_=>random.Next()).ToArray();
+            var hand=order.Take(handSize).ToArray();
+            var deck=new Queue<int>(order.Skip(handSize));
+            var expected=new List<int>();
+            var doc=new AxisDocument { Total="01:00.000",StudentCount=size,OpeningOrder=string.Join(",",order.Take(size-1)),Students=Enumerable.Range(1,10).Select(i=>$"学生{i}").ToList() };
+            for(int step=0;step<100;step++)
+            {
+                int slot=random.Next(handSize),student=hand[slot];
+                doc.Skills.Add(new() { StudentId=student,SelectRemaining=AxisDocument.Format(60000-step*100),ReleaseRemaining=AxisDocument.Format(59960-step*100),X=step,Y=step });
+                expected.Add(slot+1);
+                hand[slot]=deck.Dequeue();deck.Enqueue(student);
+            }
+            Require(doc.CompileSkills().Select(s=>s.Slot).SequenceEqual(expected),"Wrong slot during repeated circulation");
+            var events=doc.Compile();Require(events.Count==400,"Missing generated input events");
+            string Fingerprint(AxisDocument document)=>string.Join(";",document.Compile().Select(e=>$"{e.At}/{e.Event.Action}/{e.Event.Code}/{e.Event.X}/{e.Event.Y}"));
+            var copy=System.Text.Json.JsonSerializer.Deserialize<AxisDocument>(System.Text.Json.JsonSerializer.Serialize(doc))!;
+            Require(Fingerprint(doc)==Fingerprint(copy),"Save/reload changed the compiled axis");
+            Require(doc.CompileSkills().Select(s=>s.Slot).SequenceEqual(expected),"Compilation mutated card order");
+            string before=Fingerprint(copy);
+            copy.MigrateSkills();
+            Require(copy.Skills.Count==0 && copy.Events.Count==300,"Legacy migration did not produce unified rows");
+            Require(Fingerprint(copy)==before,"Unified axis changed the legacy timing or positions");
+            Require(copy.SelectionSlots().Values.SequenceEqual(expected),"Unified axis calculated different slots");
+        }
+    }
+    private static void InvalidSkills()
+    {
+        void Rejected(Action<AxisDocument> corrupt)
+        {
+            var doc=new AxisDocument { Students=Enumerable.Repeat("学生",10).ToList(),Skills=[new() { StudentId=1 }] };
+            corrupt(doc);
+            bool rejected=false;
+            try { doc.Compile(); } catch(ArgumentException) { rejected=true; }
+            Require(rejected,"Invalid EX axis accepted");
+        }
+        Rejected(d=>d.OpeningOrder="1,1,2,3,4");
+        Rejected(d=>d.OpeningOrder="1,2,3");
+        Rejected(d=>d.Skills[0].StudentId=6);
+        Rejected(d=>d.Skills[0].StudentId=10);
+        Rejected(d=>d.Students[0]="");
+        Rejected(d=>d.Skills[0].X=1920);
+        Rejected(d=>d.Skills[0].Y=-1);
+        Rejected(d=>d.Skills[0].ReleaseRemaining="02:59.980");
+        Rejected(d=>d.Skills[0].SelectRemaining="03:01.000");
+        Rejected(d=>d.End="02:59.950");
+        Rejected(d=>d.Skills.Add(new() { StudentId=2,SelectRemaining="02:59.950",ReleaseRemaining="02:59.800" }));
+    }
+    private static void Mouse()
+    {
+        Require(Marshal.SizeOf<Native.Input>() == (IntPtr.Size == 8 ? 40 : 28), "INPUT layout mismatch");
+        uint[] down = [2,8,32,128,128], up = [4,16,64,256,256];
+        for (int i = 0; i < Native.Buttons.Length; i++)
+        {
+            foreach (bool released in new[] { false, true })
+            {
+                Native.Send(new() { Action = released ? ActionKind.MouseUp : ActionKind.MouseDown, Code = Native.Buttons[i], X = 960, Y = 540 });
+                var m = lastInput.Data.Mouse;
+                Require(lastInput.Type == 0 && m.Flags == (0xC001 | (released ? up[i] : down[i])), "Mouse button flags mismatch");
+                Require(m.Data == (i >= 3 ? (uint)(i-2) : 0), "Mouse X-button data mismatch");
+            }
+        }
+        foreach (int delta in new[] { 120, -120 })
+        {
+            Native.Send(new() { Action = ActionKind.Wheel, Delta = delta });
+            Require(lastInput.Data.Mouse.Flags == 0xC801 && unchecked((int)lastInput.Data.Mouse.Data) == delta, "Wheel mismatch");
+        }
+        var desktop = SystemInformation.VirtualScreen;
+        foreach (var p in new[] { Point.Empty, new Point(960,540), new Point(1919,1079) })
+        {
+            Native.Send(new() { Action = ActionKind.Move, X = p.X, Y = p.Y });
+            var m = lastInput.Data.Mouse;
+            double x = desktop.Left + m.X * (desktop.Width - 1) / 65535.0;
+            double y = desktop.Top + m.Y * (desktop.Height - 1) / 65535.0;
+            Require(Math.Abs(x-p.X) < 0.1 && Math.Abs(y-p.Y) < 0.1, "Coordinate round-trip mismatch");
+        }
+    }
+    private static AxisEvent Key(long at, bool down, string code, int total = 1000) => new() { Remaining = AxisDocument.Format(total-at), Action = down ? ActionKind.KeyDown : ActionKind.KeyUp, Code = code };
+    private static void Recording()
+    {
+        using var recorder = new Recorder();
+        var events = new List<AxisEvent>(); recorder.Captured = events.Add;
+        void Invoke<T>(string method, int message, T data) where T : struct
+        {
+            nint pointer = Marshal.AllocHGlobal(Marshal.SizeOf<T>());
+            try
+            {
+                Marshal.StructureToPtr(data,pointer,false);
+                typeof(Recorder).GetMethod(method,System.Reflection.BindingFlags.Instance|System.Reflection.BindingFlags.NonPublic)!
+                    .Invoke(recorder,[0,(nint)message,pointer]);
+            }
+            finally { Marshal.FreeHGlobal(pointer); }
+        }
+        Invoke("OnKeyboard",0x100,new Native.KeyboardHook { Vk=0x51,Scan=16 });
+        Invoke("OnKeyboard",0x101,new Native.KeyboardHook { Vk=0x51,Scan=16,Flags=128 });
+        Invoke("OnKeyboard",0x100,new Native.KeyboardHook { Vk=0xA3,Scan=29,Flags=1 });
+        Require(events.Count==3 && events[0].Code=="16" && events[1].Action==ActionKind.KeyUp && events[2].Extended,"Recorder keyboard mismatch");
+        for(uint vk=0x75;vk<=0x78;vk++) Invoke("OnKeyboard",0x100,new Native.KeyboardHook { Vk=vk,Scan=64+vk-0x75 });
+        Invoke("OnKeyboard",0x100,new Native.KeyboardHook { Vk=0x51,Scan=16,Flags=16 });
+        Require(events.Count==4 && events[^1].Code=="16","External injected keyboard input missing");
+        Invoke("OnKeyboard",0x100,new Native.KeyboardHook { Vk=0x51,Scan=16,Flags=16,Extra=Native.Marker });
+        Require(events.Count==4,"Own playback keyboard input recorded");
+        Invoke("OnMouse",0x201,new Native.MouseHook { Point=new(123,456),Flags=1 });
+        Invoke("OnMouse",0x202,new Native.MouseHook { Point=new(123,456),Flags=1 });
+        Require(events.Count==6 && events[^2].Action==ActionKind.MouseDown && events[^1].Action==ActionKind.MouseUp && events[^1].X==123,"External injected clicks missing");
+        Invoke("OnMouse",0x201,new Native.MouseHook { Flags=1,Extra=Native.Marker });
+        Require(events.Count==6,"Own playback mouse input recorded");
+        (int Message,string Code,ActionKind Action,uint Data)[] mouse = [
+            (0x201,"Left",ActionKind.MouseDown,0),(0x202,"Left",ActionKind.MouseUp,0),
+            (0x204,"Right",ActionKind.MouseDown,0),(0x205,"Right",ActionKind.MouseUp,0),
+            (0x207,"Middle",ActionKind.MouseDown,0),(0x208,"Middle",ActionKind.MouseUp,0),
+            (0x20B,"X1",ActionKind.MouseDown,1u<<16),(0x20C,"X1",ActionKind.MouseUp,1u<<16),
+            (0x20B,"X2",ActionKind.MouseDown,2u<<16),(0x20C,"X2",ActionKind.MouseUp,2u<<16)];
+        foreach(var m in mouse)
+        {
+            Invoke("OnMouse",m.Message,new Native.MouseHook { Point=new(321,654), Data=m.Data });
+            Require(events[^1].Code==m.Code && events[^1].Action==m.Action && events[^1].X==321 && events[^1].Y==654,"Recorder mouse mismatch");
+        }
+        Invoke("OnMouse",0x20A,new Native.MouseHook { Data=unchecked((uint)(-120<<16)) });
+        Require(events[^1].Action==ActionKind.Wheel && events[^1].Delta==-120,"Recorder wheel sign mismatch");
+    }
+    private static Thread Start(Runner runner) { var t = new Thread(runner.Run) { IsBackground = true }; t.Start(); return t; }
+    private static void Timing()
+    {
+        double maxError = 0; int late = 0;
+        for (int i = 0; i < 100; i++)
+        {
+            var doc = new AxisDocument { Total = "00:01.000", End = "00:00.970", Events = [Key(0,true,"16"),Key(10,true,"17"),Key(20,false,"16"),Key(30,false,"17")] };
+            var clock = new Stopwatch(); var emitted = new List<AxisEvent>();
+            var runner = new Runner(doc,1,e => { if (!clock.IsRunning) clock.Start(); double error = Math.Abs(clock.Elapsed.TotalMilliseconds - emitted.Count*10); maxError = Math.Max(maxError,error); if (error>16.667) late++; emitted.Add(e); });
+            runner.Finished = () => { };
+            var thread = Start(runner); Require(thread.Join(2000), "Timing trial timed out");
+            Require(emitted.Select(e=>$"{e.Action}/{e.Code}").SequenceEqual(new[]{"KeyDown/16","KeyDown/17","KeyUp/16","KeyUp/17"}), "Event order differs");
+        }
+        results.Add($"INFO 100 passes / 400 callbacks, max relative callback error {maxError:F3} ms, errors >16.667ms {late}; intercepted sender, excludes OS/game input latency");
+        Require(late == 0,"Observed scheduling error above one-frame target");
+    }
+    private static void FailedRelease()
+    {
+        var doc = new AxisDocument { Total="00:10.000", Events=[Key(0,true,"16",10000),Key(0,true,"17",10000),Key(9000,false,"16",10000),Key(9000,false,"17",10000)] };
+        using var ready = new ManualResetEventSlim();
+        var attempted = new List<string>(); int downs = 0;
+        var runner = new Runner(doc,1,e => { if(e.Action==ActionKind.KeyDown && ++downs==2) ready.Set(); if(e.Action==ActionKind.KeyUp) { attempted.Add(e.Code); if(e.Code=="16") throw new IOException("Simulated key-up failure"); } });
+        var thread = Start(runner);
+        Require(ready.Wait(2000), "Did not press keys");
+        try
+        {
+            try { runner.Pause(); } catch(IOException) { }
+            Require(attempted.Contains("17"), "Key 16 release failure prevented attempting Key 17 release");
+        }
+        finally { try { runner.Stop(); } catch(IOException) { } thread.Join(2000); }
+    }
+    private static AxisDocument LoopDocument()
+    {
+        return new AxisDocument { Total="00:01.000", End="00:00.850", BattleStartOffsetMs=50, Events=[new() {Action=ActionKind.Move,Remaining="00:01.050"},new() {Action=ActionKind.Move,Remaining="00:01.000",IsBattleStart=true}] };
+    }
+    private static void SpaceCollision()
+    {
+        var doc = LoopDocument(); doc.Events.AddRange([Key(10,true,"57"),Key(60,true,"16"),Key(61,false,"16"),Key(100,false,"57")]);
+        bool spaceHeld = false, valid = true;
+        var runner = new Runner(doc,2,e => { if(e.Code=="57") spaceHeld=e.Action==ActionKind.KeyDown; if(e.Code=="16" && e.Action==ActionKind.KeyDown) valid &= spaceHeld; },_=>RestartDetection.CreateSample());
+        var thread=Start(runner); Require(thread.Join(8000),"Loop timed out");
+        Require(valid,"Space was released at 40ms while axis required it held from 10ms to 100ms");
+    }
+    private static void RepeatedRestart()
+    {
+        var doc=LoopDocument(); doc.End="00:00.000";
+        using var firstRestart=new ManualResetEventSlim();
+        var messages=new List<string>(); int escapes=0;
+        var runner=new Runner(doc,2,e=> { if(e.Action==ActionKind.KeyDown && e.Code=="1") Interlocked.Increment(ref escapes); },_=>RestartDetection.CreateSample());
+        runner.Status=m=> { lock(messages) messages.Add(m); if(m=="按 Esc 检查是否进入下一轮") firstRestart.Set(); };
+        var thread=Start(runner);
+        Require(firstRestart.Wait(3000),"Did not enter automatic restart");
+        runner.Restart();
+        runner.Restart();
+        bool terminated=thread.Join(300);
+        runner.Stop(); thread.Join(2000);
+        Require(!terminated,"Second F9 request inside restart handler terminated playback");
+        Require(escapes == 2,"Repeated F9 sent extra Esc events beyond opening and closing the pause menu");
+    }
+    private static void ManualRestart()
+    {
+        var doc=LoopDocument();
+        using var active=new ManualResetEventSlim();
+        var messages=new List<string>();
+        var runner=new Runner(doc,1,_=>{},_=>RestartDetection.CreateSample());
+        runner.Status=m=> { messages.Add(m); if(m.StartsWith("执行第 1/1 轮")) active.Set(); };
+        var thread=Start(runner);
+        Require(active.Wait(2000),"First round did not start");
+        runner.Restart();
+        Require(thread.Join(8000),"Manual retry did not finish");
+        Require(messages.Count(m=>m.StartsWith("执行第 1/1 轮"))==2 && messages.Last()=="已达到次数上限","Manual retry changed the round count or failed");
+    }
+    private static void ShortSpace()
+    {
+        var doc=LoopDocument();
+        doc.Events.AddRange([Key(0,true,"057"),Key(5,false,"57")]);
+        var releases=new List<double>();
+        var clock=new Stopwatch();
+        int rounds=0;
+        var runner=new Runner(doc,2,e=> { if(rounds==2 && e.Action==ActionKind.KeyUp && e.Code=="57") releases.Add(clock.Elapsed.TotalMilliseconds); },_=>RestartDetection.CreateSample());
+        runner.Status=m=> { if(m.StartsWith("执行第")) { rounds++; clock.Restart(); } };
+        var thread=Start(runner); Require(thread.Join(8000),"Short Space trial timed out");
+        Require(releases.Count==1,"Extra skip-confirm or cleanup release was sent after axis Space release");
+    }
+    private static void PausedRestart()
+    {
+        var doc=LoopDocument();
+        using var pressed=new ManualResetEventSlim(); using var resumed=new ManualResetEventSlim();
+        int reopenCount=0;
+        var runner=new Runner(doc,2,e=> { if(e.Action==ActionKind.KeyDown && e.Code=="1") pressed.Set(); },_=>RestartDetection.CreateSample());
+        runner.Status=m=> { if(m=="按 Esc 检查是否进入下一轮" && ++reopenCount==2) resumed.Set(); };
+        var thread=Start(runner); Require(pressed.Wait(2000),"Did not start restart procedure");
+        runner.Pause(); runner.Restart();
+        bool retried=resumed.Wait(2000);
+        runner.Stop(); Require(thread.Join(2000),"Stop did not finish after interrupted restart");
+        Require(retried,"F9 did not recover a paused restart procedure");
+    }
+}
+
+

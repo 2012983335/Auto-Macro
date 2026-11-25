@@ -1,0 +1,6 @@
+<assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+  <assemblyIdentity version="1.0.0.0" name="Auto-宏"/>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3"><windowsSettings>
+    <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+  </windowsSettings></application>
+</assembly>

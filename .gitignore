@@ -1,0 +1,9 @@
+bin/
+obj/
+*.user
+dist/
+logs/
+checks/ahk-fix/
+checks/*results.txt
+checks/timing-before-fix.txt
+*.pdb
