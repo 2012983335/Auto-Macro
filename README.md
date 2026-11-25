@@ -6,7 +6,7 @@
 
 ## 下载与使用
 
-在 [Releases](../../releases/latest) 下载独立运行版压缩包，解压后启动 `Auto-宏.exe`。已包含 .NET 运行库，无需另外安装。
+在 [Releases](https://github.com/2012983335/Auto-Macro/releases/latest) 下载独立运行版压缩包，解压后启动 `Auto-宏.exe`。已包含 .NET 运行库，无需另外安装。
 
 当前版本适用于 Windows x64，主显示器分辨率须为 **1920×1080**。坐标采用绝对像素，回放时请保持目标窗口的位置和大小与录制一致。
 
@@ -56,3 +56,4 @@ dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=
 ```
 
 检查结果输出到对应程序目录。自动验收使用合成输入，不会向目标程序发送真实操作。
+
